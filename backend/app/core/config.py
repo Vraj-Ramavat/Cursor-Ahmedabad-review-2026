@@ -10,8 +10,15 @@ class Settings(BaseSettings):
     debug: bool = False
     database_url: str = "sqlite:///./hospital_prep.db"
     redis_url: str = "redis://localhost:6379/0"
+    # Cursor Agent SDK (text LLM + vision OCR). Two keys rotate for failover.
+    cursor_api_key: str = ""
+    cursor_api_key_2: str = ""
+    cursor_model: str = "composer-2.5"
+    # Legacy keys kept for optional fallbacks / YouTube meals only.
     groq_api_key: str = ""
     gemini_api_key: str = ""
+    youtube_api_key: str = ""
+    usda_api_key: str = ""
     celery_beat_interval_seconds: int = 45
     queue_aging_rate: float = 1.0
     queue_auto_escalate_minutes: int = 45

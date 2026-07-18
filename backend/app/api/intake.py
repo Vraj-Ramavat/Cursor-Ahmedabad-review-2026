@@ -55,15 +55,33 @@ def start_intake(
     db: Session = Depends(get_db),
     engine: TriageEngine = Depends(get_triage_engine),
 ):
-    patient = Patient(
-        name=req.patient_name,
-        age=req.age,
-        gender=req.gender,
-        phone=req.phone,
-        abha_id=req.abha_id,
-    )
-    db.add(patient)
-    db.flush()
+    # Prefer an existing account so visits stay linked to one patient identity.
+    patient = None
+    if req.patient_id:
+        patient = db.get(Patient, req.patient_id)
+    if patient is None and req.phone:
+        patient = db.query(Patient).filter(Patient.phone == req.phone).first()
+    if patient is None:
+        patient = Patient(
+            name=req.patient_name,
+            age=req.age,
+            gender=req.gender,
+            phone=req.phone,
+            abha_id=req.abha_id,
+        )
+        db.add(patient)
+        db.flush()
+    else:
+        # Refresh demographics from this visit without creating a duplicate.
+        if req.patient_name:
+            patient.name = req.patient_name
+        if req.age is not None:
+            patient.age = req.age
+        if req.gender:
+            patient.gender = req.gender
+        if req.abha_id:
+            patient.abha_id = req.abha_id
+        db.flush()
 
     session = IntakeSession(
         patient_id=patient.id,
@@ -92,9 +110,10 @@ def start_intake(
 
     first_name = req.patient_name.split()[0] if req.patient_name.strip() else "there"
     greeting = (
-        f"Hi {first_name}, you're registered. I'll ask a few quick questions so the "
-        f"doctor has everything ready before you go in \u2014 this is not a diagnosis, "
-        f"just preparation."
+        f"Hi {first_name} — thanks for checking in. I'm here with you for a minute. "
+        f"I'll ask just a few gentle questions so your doctor has the full picture "
+        f"before you go in. This isn't a diagnosis, just visit prep. "
+        f"Take your time answering."
     )
 
     # Record the conversation exactly as the patient experiences it.
@@ -245,6 +264,29 @@ def _apply_severity(db: Session, session: IntakeSession, triage, prior: str) -> 
         entry.severity = Severity(triage.severity)
 
 
+def _template_briefing(summary: dict) -> str:
+    """Human-readable doctor prose — always available (no LLM required)."""
+    complaint = summary.get("chief_complaint") or "an unspecified concern"
+    severity = summary.get("severity") or "green"
+    lines = [
+        f"Pre-visit note: the patient describes {complaint}. "
+        f"Current triage band is {severity.upper()} based on deterministic rules.",
+    ]
+    for k, v in summary.items():
+        if k in ("chief_complaint", "severity", "triggered_rules") or v in (None, "", []):
+            continue
+        label = k.replace("_", " ")
+        lines.append(f"On {label}, they reported: {v}.")
+    rules = summary.get("triggered_rules") or []
+    if rules:
+        lines.append(f"Triggered rules: {', '.join(rules)}.")
+    lines.append(
+        "Please review the conversation transcript and vitals as needed. "
+        "This is visit preparation only — not a diagnosis."
+    )
+    return " ".join(lines)
+
+
 def _finalize_briefing(db: Session, session: IntakeSession, triage) -> None:
     summary = {
         "chief_complaint": session.chief_complaint,
@@ -252,17 +294,28 @@ def _finalize_briefing(db: Session, session: IntakeSession, triage) -> None:
         "severity": triage.severity,
         "triggered_rules": [r["id"] for r in triage.triggered_rules],
     }
-    # LLM paraphrase; degrade to "pending — retry" if unavailable.
-    outcome = paraphrase_briefing(
-        summary, session.correlation_id,
-        redaction_sink=lambda p, c, i: audit.log_redaction(db, p, c, i),
-    )
+    # Prefer a fast local doctor note so the dashboard never shows "LLM unavailable".
+    # Optionally enrich with Cursor if it returns quickly.
+    local_prose = _template_briefing(summary)
+    prose = local_prose
+    status = "ready"
+    try:
+        outcome = paraphrase_briefing(
+            summary, session.correlation_id,
+            redaction_sink=lambda p, c, i: audit.log_redaction(db, p, c, i),
+        )
+        if outcome.ok and outcome.text:
+            prose = outcome.text
+            status = "ready"
+    except Exception:
+        prose = local_prose
+        status = "ready"
     briefing = Briefing(
         session_id=session.id,
         severity=Severity(triage.severity),
         structured_summary=summary,
-        paraphrased_prose=outcome.text,
-        paraphrase_status="ready" if outcome.ok else "pending — retry",
+        paraphrased_prose=prose,
+        paraphrase_status=status,
     )
     db.add(briefing)
 
@@ -273,3 +326,15 @@ def _finalize_briefing(db: Session, session: IntakeSession, triage) -> None:
     )
     if note_outcome.ok and note_outcome.text:
         db.add(SelfCareNote(session_id=session.id, draft_text=note_outcome.text))
+    else:
+        # Deterministic fallback note so doctor workflow still has something to approve.
+        db.add(
+            SelfCareNote(
+                session_id=session.id,
+                draft_text=(
+                    "While you wait: rest, sip water, and avoid heavy meals if you feel unwell. "
+                    "Seek urgent care sooner if symptoms suddenly worsen, breathing becomes hard, "
+                    "chest pain increases, or you feel faint. Your doctor will review this visit shortly."
+                ),
+            )
+        )

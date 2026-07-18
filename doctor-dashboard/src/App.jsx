@@ -7,8 +7,33 @@ import {
   correctDocumentField,
   openQueueSocket,
 } from "./api.js";
+import WalkInNurse from "./WalkInNurse.jsx";
 
 const SEV_LABEL = { red: "RED", amber: "AMBER", green: "GREEN" };
+
+function initials(name) {
+  if (!name) return "?";
+  return name
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() || "")
+    .join("");
+}
+
+function avatarColor(name) {
+  const colors = ["c1", "c2", "c3", "c4", "c5", "c6"];
+  let hash = 0;
+  for (let i = 0; i < (name || "").length; i++) hash = name.charCodeAt(i) + hash * 31;
+  return colors[Math.abs(hash) % colors.length];
+}
+
+function formatMeta(entry) {
+  const parts = [];
+  if (entry.age) parts.push(`${entry.age}y`);
+  if (entry.gender) parts.push(entry.gender);
+  if (entry.chief_complaint) parts.push(entry.chief_complaint);
+  return parts.join(" · ") || "No details";
+}
 
 export default function App() {
   const [queue, setQueue] = useState({ live: false, banner: null, entries: [] });
@@ -17,27 +42,48 @@ export default function App() {
   const [notes, setNotes] = useState([]);
   const [connected, setConnected] = useState(false);
   const [tab, setTab] = useState("briefing");
+  const [walkInOpen, setWalkInOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      setQueue(await getQueueStatus());
-      setNotes(await getPendingNotes());
+      const q = await getQueueStatus();
+      setQueue(q);
+      try {
+        const n = await getPendingNotes();
+        setNotes(Array.isArray(n) ? n : []);
+      } catch {
+        /* notes optional — never block the queue */
+      }
     } catch {
-      setQueue((q) => ({ ...q, live: false, banner: "backend unreachable" }));
+      setQueue((q) => ({
+        live: false,
+        banner: "backend unreachable — retrying…",
+        entries: Array.isArray(q.entries) ? q.entries : [],
+      }));
     }
   }, []);
 
   useEffect(() => {
     refresh();
-    const ws = openQueueSocket((data) => {
-      setQueue(data);
-      setConnected(true);
-    });
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-    const poll = setInterval(refresh, 8000);
+    let ws;
+    try {
+      ws = openQueueSocket((data) => {
+        if (!data || !Array.isArray(data.entries)) return;
+        setQueue({
+          live: !!data.live,
+          banner: data.banner || null,
+          entries: data.entries,
+        });
+        setConnected(true);
+      });
+      ws.onclose = () => setConnected(false);
+      ws.onerror = () => setConnected(false);
+    } catch {
+      setConnected(false);
+    }
+    const poll = setInterval(refresh, 5000);
     return () => {
-      ws.close();
+      try { ws?.close(); } catch { /* ignore */ }
       clearInterval(poll);
     };
   }, [refresh]);
@@ -59,99 +105,166 @@ export default function App() {
     if (selected) setDetail(await getSessionDetail(selected));
   }
 
-  const redCount = queue.entries.filter((e) => e.severity === "red").length;
+  const entries = Array.isArray(queue.entries) ? queue.entries : [];
+  const redCount = entries.filter((e) => e.severity === "red").length;
 
   return (
     <div className="layout">
-      <header>
-        <div>
-          <h1>Clinic Command — Doctor Dashboard</h1>
-          <p className="sub">
-            {queue.entries.length} waiting · {redCount} critical ·{" "}
-            {notes.length} note{notes.length === 1 ? "" : "s"} awaiting approval
-          </p>
+      <header className="app-bar">
+        <div className="app-bar-brand">
+          <div className="app-logo" aria-hidden="true">CP</div>
+          <h1 className="app-title">Clinic Prep · Doctor</h1>
         </div>
-        <span className={`conn ${connected ? "on" : "off"}`}>
-          {connected ? "live" : "polling"}
-        </span>
+        <div className="app-bar-actions">
+          <span className={`chip ${connected ? "conn-live" : "conn-poll"}`}>
+            {connected ? "Live" : "Polling"}
+          </span>
+          <span className="chip stat-waiting">
+            <strong>{entries.length}</strong> waiting
+          </span>
+          {redCount > 0 && (
+            <span className="chip stat-red">
+              <strong>{redCount}</strong> critical
+            </span>
+          )}
+          <span className="chip stat-notes">
+            <strong>{notes.length}</strong> note{notes.length === 1 ? "" : "s"}
+          </span>
+          <button type="button" className="chip walkin-btn" onClick={() => setWalkInOpen(true)}>
+            Walk-in nurse
+          </button>
+          <button type="button" className="chip refresh-btn" onClick={refresh}>
+            Refresh
+          </button>
+        </div>
       </header>
 
-      {!queue.live && (
-        <div className="banner paused">
-          {queue.banner || "background auto-rescore paused — Redis/Celery offline"}
-        </div>
-      )}
-      {redCount > 0 && (
-        <div className="banner critical">
-          {redCount} patient{redCount > 1 ? "s" : ""} flagged RED — deterministic
-          rule engine escalation (cannot be downgraded by AI)
-        </div>
+      {walkInOpen && (
+        <WalkInNurse
+          onClose={() => setWalkInOpen(false)}
+          onComplete={async (sessionId) => {
+            await refresh();
+            if (sessionId) await selectPatient(sessionId);
+          }}
+        />
       )}
 
-      <div className="grid">
-        <section className="queue">
-          <h2>Priority Queue</h2>
-          {queue.entries.length === 0 && <p className="muted">No patients waiting.</p>}
-          {queue.entries.map((e, i) => (
-            <button
-              key={e.session_id}
-              className={`qrow sev-${e.severity} ${selected === e.session_id ? "sel" : ""}`}
-              onClick={() => selectPatient(e.session_id)}
-            >
-              <div className="qtop">
-                <span className="rank">#{i + 1}</span>
-                <span className="pname">{e.patient_name}</span>
-                <span className={`pill sev-${e.severity}`}>{SEV_LABEL[e.severity]}</span>
+      <div className="banners">
+        {!queue.live && (
+          <div className="banner paused">
+            <span className="banner-icon" aria-hidden="true">⚠</span>
+            {queue.banner || "Background auto-rescore paused — Redis/Celery offline"}
+          </div>
+        )}
+        {redCount > 0 && (
+          <div className="banner critical">
+            <span className="banner-icon" aria-hidden="true">🚨</span>
+            {redCount} patient{redCount > 1 ? "s" : ""} flagged RED — deterministic rule
+            engine escalation (cannot be downgraded by AI)
+          </div>
+        )}
+      </div>
+
+      <div className="main">
+        <section className="panel queue">
+          <div className="panel-header">
+            <h2>Priority Queue ({entries.length})</h2>
+          </div>
+          <div className="panel-body scroll">
+            {entries.length === 0 && (
+              <div className="queue-empty">
+                <p className="muted">No patients waiting.</p>
+                <button type="button" className="mini" onClick={refresh} style={{ marginTop: 12 }}>
+                  Reload queue
+                </button>
               </div>
-              <div className="qbottom">
-                <span>{e.age ? `${e.age}y` : ""} {e.gender || ""}</span>
-                <span className="complaint">{e.chief_complaint}</span>
-                <span>score {e.priority_score}</span>
-                <span>{e.minutes_waited} min</span>
-                {e.document_count > 0 && <span className="docs">{e.document_count} doc(s)</span>}
-                {e.auto_escalated && <span className="escalated">auto-escalated</span>}
-              </div>
-            </button>
-          ))}
+            )}
+            {entries.map((e, i) => (
+              <button
+                key={e.session_id}
+                className={`qcard sev-${e.severity} ${selected === e.session_id ? "sel" : ""}`}
+                onClick={() => selectPatient(e.session_id)}
+              >
+                <div className={`avatar ${avatarColor(e.patient_name)}`}>
+                  {initials(e.patient_name)}
+                </div>
+                <div className="qcard-content">
+                  <div className="qcard-top">
+                    <span className="qcard-rank">#{i + 1}</span>
+                    <span className="qcard-name">{e.patient_name}</span>
+                    <span className={`pill sev-${e.severity}`}>{SEV_LABEL[e.severity]}</span>
+                  </div>
+                  <div className="qcard-meta">{formatMeta(e)}</div>
+                  <div className="qcard-footer">
+                    <span>Score {e.priority_score}</span>
+                    <span>{e.minutes_waited} min wait</span>
+                    {e.document_count > 0 && <span>{e.document_count} doc{e.document_count > 1 ? "s" : ""}</span>}
+                    {e.auto_escalated && <span className="escalated">Auto-escalated</span>}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
         </section>
 
-        <section className="detail">
+        <section className="panel detail">
           {!detail && (
             <div className="empty">
+              <div className="empty-icon" aria-hidden="true">👤</div>
               <h2>Select a patient</h2>
               <p className="muted">
-                Click a queue entry to see their profile, the AI intake conversation,
-                uploaded documents, and the pre-visit briefing.
+                Click a queue entry to see their profile, AI intake conversation,
+                uploaded documents, and pre-visit briefing.
               </p>
             </div>
           )}
 
           {detail && (
-            <div>
-              <div className="profile-card">
-                <div>
-                  <h2>{detail.patient.name}</h2>
-                  <p className="muted">
-                    {detail.patient.age ? `${detail.patient.age} yrs` : "age n/a"} ·{" "}
-                    {detail.patient.gender || "gender n/a"} ·{" "}
-                    {detail.patient.phone || "no phone"} ·{" "}
-                    ABHA: {detail.patient.abha_id || "not linked"}
-                  </p>
-                  <p className="muted">
-                    Registered {new Date(detail.patient.registered_at + "Z").toLocaleTimeString()} ·
-                    Complaint: <b>{detail.chief_complaint}</b> ·
-                    Intake {detail.completed ? "complete" : "in progress"}
-                  </p>
+            <>
+              <div className="patient-header">
+                <div className={`avatar lg ${avatarColor(detail.patient.name)}`}>
+                  {initials(detail.patient.name)}
                 </div>
-                <span className={`pill big sev-${detail.severity}`}>
-                  {SEV_LABEL[detail.severity]}
-                </span>
+                <div className="patient-info">
+                  <h2>{detail.patient.name}</h2>
+                  <p className="patient-subline">
+                    {detail.patient.age ? `${detail.patient.age} yrs` : "Age n/a"} ·{" "}
+                    {detail.patient.gender || "Gender n/a"} ·{" "}
+                    {detail.patient.phone || "No phone"} ·{" "}
+                    ABHA {detail.patient.abha_id || "not linked"}
+                  </p>
+                  <p className="patient-subline">
+                    Registered{" "}
+                    {new Date(detail.patient.registered_at + "Z").toLocaleString(undefined, {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    })}
+                  </p>
+                  <p className="patient-complaint">
+                    Chief complaint: <strong>{detail.chief_complaint}</strong>
+                  </p>
+                  <div className="patient-chips">
+                    <span className={`pill sev-${detail.severity}`}>
+                      {SEV_LABEL[detail.severity]}
+                    </span>
+                    {detail.documents.length > 0 && (
+                      <span className="info-chip docs">
+                        {detail.documents.length} document{detail.documents.length > 1 ? "s" : ""}
+                      </span>
+                    )}
+                    <span className={`info-chip ${detail.completed ? "complete" : "in-progress"}`}>
+                      Intake {detail.completed ? "complete" : "in progress"}
+                    </span>
+                  </div>
+                </div>
               </div>
 
-              <nav className="tabs">
+              <nav className="tabs" role="tablist">
                 {["briefing", "conversation", "documents", "symptoms", "escalations", "self-care"].map((t) => (
                   <button
                     key={t}
+                    role="tab"
+                    aria-selected={tab === t}
                     className={tab === t ? "tab on" : "tab"}
                     onClick={() => setTab(t)}
                   >
@@ -161,17 +274,19 @@ export default function App() {
                 ))}
               </nav>
 
-              {tab === "briefing" && <BriefingTab briefing={detail.briefing} />}
-              {tab === "conversation" && <ConversationTab transcript={detail.transcript} />}
-              {tab === "documents" && (
-                <DocumentsTab documents={detail.documents} onCorrect={onCorrectField} />
-              )}
-              {tab === "symptoms" && <SymptomsTab symptoms={detail.symptoms} />}
-              {tab === "escalations" && <EscalationsTab escalations={detail.escalations} />}
-              {tab === "self-care" && (
-                <SelfCareTab note={detail.self_care_note} notes={notes} onApprove={onApprove} />
-              )}
-            </div>
+              <div className="tab-content">
+                {tab === "briefing" && <BriefingTab briefing={detail.briefing} />}
+                {tab === "conversation" && <ConversationTab transcript={detail.transcript} />}
+                {tab === "documents" && (
+                  <DocumentsTab documents={detail.documents} onCorrect={onCorrectField} />
+                )}
+                {tab === "symptoms" && <SymptomsTab symptoms={detail.symptoms} />}
+                {tab === "escalations" && <EscalationsTab escalations={detail.escalations} />}
+                {tab === "self-care" && (
+                  <SelfCareTab note={detail.self_care_note} notes={notes} onApprove={onApprove} />
+                )}
+              </div>
+            </>
           )}
         </section>
       </div>
@@ -183,21 +298,22 @@ function BriefingTab({ briefing }) {
   if (!briefing) {
     return <p className="muted">Briefing is generated when the intake conversation completes.</p>;
   }
+  const prose = briefing.paraphrased_prose;
   return (
     <div>
       <h3>Structured summary (deterministic)</h3>
       <ul>
-        {Object.entries(briefing.structured_summary).map(([k, v]) => (
+        {Object.entries(briefing.structured_summary || {}).map(([k, v]) => (
           <li key={k}>
             <b>{k}:</b> {Array.isArray(v) ? v.join(", ") : String(v)}
           </li>
         ))}
       </ul>
-      <h3>AI paraphrase for doctor</h3>
-      {briefing.paraphrase_status !== "ready" ? (
-        <p className="pending">{briefing.paraphrase_status} (LLM unavailable — structured data above is complete)</p>
+      <h3>Doctor briefing</h3>
+      {prose ? (
+        <p>{prose}</p>
       ) : (
-        <p>{briefing.paraphrased_prose}</p>
+        <p className="pending">Briefing text pending — structured data above is complete.</p>
       )}
     </div>
   );
@@ -331,7 +447,10 @@ function SelfCareTab({ note, notes, onApprove }) {
       )}
       {note && !pendingForSession && (
         <div>
-          <p><b>Status:</b> {note.approval_status} {note.sent_to_patient ? "· sent to patient" : "· not sent"}</p>
+          <p>
+            <b>Status:</b> {note.approval_status}{" "}
+            {note.sent_to_patient ? "· sent to patient" : "· not sent"}
+          </p>
           <p>{note.final_text || note.draft_text}</p>
         </div>
       )}
@@ -351,10 +470,10 @@ function NoteCard({ note, onApprove }) {
   const edited = text !== note.draft_text;
   return (
     <div className="note">
-      <p className="muted">session {note.session_id.slice(0, 8)} · drafted by AI, doctor-gated</p>
+      <p className="muted">Session {note.session_id.slice(0, 8)} · drafted by AI, doctor-gated</p>
       <textarea value={text} onChange={(e) => setText(e.target.value)} rows={4} />
       <div className="note-actions">
-        <button onClick={() => onApprove(note.id, edited ? text : null)}>
+        <button className="btn-filled" onClick={() => onApprove(note.id, edited ? text : null)}>
           {edited ? "Save & approve" : "Approve"}
         </button>
       </div>

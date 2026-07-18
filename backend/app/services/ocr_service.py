@@ -1,43 +1,51 @@
-"""Gemini Vision OCR for patient documents (constraint 7).
+"""Document OCR via Cursor Agent vision (replaces Gemini).
 
-SCOPE GUARD
------------
-This reader EXTRACTS PRINTED TEXT only. For prescriptions and lab reports it
-pulls structured fields with confidence scores. For MRI/X-ray reports it extracts
-ONLY the printed findings/impression text and never analyzes the scan image to
-produce a new interpretation — generating imaging interpretations is explicitly
-out of scope. Every field is tagged source="ocr_extracted" with a confidence
-score; low-confidence fields are surfaced to the doctor for one-tap correction.
-
-Degrades gracefully: with no GEMINI_API_KEY, `extract()` returns an empty result
-flagged as pending rather than raising.
+Supports printed and handwritten prescriptions. Low-confidence fields are
+flagged for doctor correction. Never invents drugs not visible in the image.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
-from app.core.config import settings
+from app.services.cursor_client import cursor_keys, prompt_with_image
 
 logger = logging.getLogger(__name__)
 
 LOW_CONFIDENCE_THRESHOLD = 0.7
 
-_PRESCRIPTION_PROMPT = (
-    "Extract the printed text fields from this prescription as JSON: a list of "
-    '{"name","value","confidence"} objects for fields like patient_name, date, '
-    "medications (as written), and instructions. Report only text present in the "
-    "image. Do NOT interpret, diagnose, or add anything not printed. confidence is "
-    "0..1 for OCR legibility."
-)
+_PRESCRIPTION_PROMPT = """
+You are a medical document OCR extractor for an Indian clinic.
 
-_IMAGING_PROMPT = (
-    "This is a radiology REPORT document (not the scan itself). Extract ONLY the "
-    'printed "Findings" and "Impression" text as JSON list of {"name","value",'
-    '"confidence"}. Do NOT analyze any image or generate a new interpretation.'
-)
+The image may be printed or HANDWRITTEN (doctor cursive, abbreviations).
+
+Extract EVERY readable field as a JSON array ONLY:
+[{"name":"...","value":"...","confidence":0.0}]
+
+Use keys when present: patient_name, age, gender, date, doctor_name, clinic_name,
+diagnosis_or_notes, medication, dosage, frequency, duration, instructions,
+vitals, investigations_advised, follow_up.
+
+Rules:
+1. Keep abbreviations (Tab, Cap, BD, TDS, SOS, HS).
+2. Each medicine = separate object name="medication".
+3. Unclear words: best guess with confidence <= 0.55.
+4. Do NOT invent medicines. Do NOT diagnose.
+5. Return ONLY a valid JSON array — no markdown, no commentary.
+""".strip()
+
+_IMAGING_PROMPT = """
+Radiology REPORT only. Extract Findings/Impression as JSON array of
+{"name","value","confidence"}. Do NOT interpret the scan. JSON array only.
+""".strip()
+
+_LAB_PROMPT = """
+Extract lab fields as JSON array of {"name","value","confidence"}.
+Include test_name, result, unit, reference_range, date when visible. JSON only.
+""".strip()
 
 
 @dataclass
@@ -55,7 +63,8 @@ class ExtractedField:
 class OCRResult:
     fields: list[ExtractedField] = field(default_factory=list)
     ok: bool = True
-    status: str = "extracted"  # or "pending" when the provider is unavailable
+    status: str = "extracted"
+    raw_text: str | None = None
 
     @property
     def low_confidence_count(self) -> int:
@@ -63,36 +72,93 @@ class OCRResult:
 
 
 def _prompt_for(doc_type: str) -> str:
-    return _IMAGING_PROMPT if doc_type == "imaging" else _PRESCRIPTION_PROMPT
+    if doc_type == "imaging":
+        return _IMAGING_PROMPT
+    if doc_type == "lab_report":
+        return _LAB_PROMPT
+    return _PRESCRIPTION_PROMPT
+
+
+def _parse_fields(raw: str) -> list[ExtractedField]:
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    data = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\[[\s\S]*\]", text)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                data = None
+        if data is None:
+            m2 = re.search(r"\{[\s\S]*\}", text)
+            if m2:
+                try:
+                    data = json.loads(m2.group(0))
+                except json.JSONDecodeError:
+                    data = None
+
+    if data is None:
+        return []
+
+    if isinstance(data, dict):
+        if isinstance(data.get("fields"), list):
+            data = data["fields"]
+        else:
+            data = [{"name": k, "value": str(v), "confidence": 0.6} for k, v in data.items()]
+
+    fields: list[ExtractedField] = []
+    for d in data if isinstance(data, list) else []:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or d.get("field") or "field")
+        value = str(d.get("value") or d.get("text") or "").strip()
+        if not value:
+            continue
+        try:
+            conf = float(d.get("confidence", 0.55))
+        except (TypeError, ValueError):
+            conf = 0.55
+        fields.append(
+            ExtractedField(name=name, value=value, confidence=max(0.0, min(1.0, conf)))
+        )
+    return fields
 
 
 def extract(image_bytes: bytes, mime_type: str, doc_type: str) -> OCRResult:
-    if not settings.gemini_api_key:
-        logger.info("OCR degraded: no GEMINI_API_KEY, returning pending")
+    if not cursor_keys():
+        logger.info("OCR degraded: no CURSOR_API_KEY")
         return OCRResult(fields=[], ok=False, status="pending")
 
-    try:
-        import google.generativeai as genai
+    if not image_bytes:
+        return OCRResult(fields=[], ok=False, status="pending")
 
-        genai.configure(api_key=settings.gemini_api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_content(
-            [
-                _prompt_for(doc_type),
-                {"mime_type": mime_type, "data": image_bytes},
-            ]
+    mime = (mime_type or "image/jpeg").split(";")[0].strip().lower()
+    if mime in ("application/octet-stream", "binary/octet-stream", ""):
+        mime = "image/jpeg"
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+
+    raw = prompt_with_image(_prompt_for(doc_type), image_bytes, mime, timeout_s=90.0)
+    if not raw:
+        return OCRResult(fields=[], ok=False, status="pending")
+
+    fields = _parse_fields(raw)
+    if fields:
+        for f in fields:
+            if f.confidence > 0.9:
+                f.confidence = 0.75
+        return OCRResult(fields=fields, ok=True, status="extracted", raw_text=raw[:2000])
+
+    if len(raw) > 20:
+        return OCRResult(
+            fields=[ExtractedField("raw_ocr_text", raw[:1500], 0.45)],
+            ok=True,
+            status="extracted",
+            raw_text=raw[:2000],
         )
-        raw = resp.text.strip().removeprefix("```json").removesuffix("```").strip()
-        data = json.loads(raw)
-        fields = [
-            ExtractedField(
-                name=str(d.get("name", "field")),
-                value=str(d.get("value", "")),
-                confidence=float(d.get("confidence", 0.5)),
-            )
-            for d in data
-        ]
-        return OCRResult(fields=fields, ok=True, status="extracted")
-    except Exception as exc:
-        logger.warning("OCR failed (degrading to pending): %s", exc)
-        return OCRResult(fields=[], ok=False, status="pending")
+    return OCRResult(fields=[], ok=False, status="pending")

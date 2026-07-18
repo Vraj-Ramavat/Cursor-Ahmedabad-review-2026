@@ -35,3 +35,16 @@ def init_db() -> None:
     from app import models  # noqa: F401  ensure models are registered
 
     Base.metadata.create_all(bind=engine)
+    _ensure_sqlite_columns()
+
+
+def _ensure_sqlite_columns() -> None:
+    """Best-effort ALTER for new columns on existing SQLite demo DBs."""
+    if not settings.database_url.startswith("sqlite"):
+        return
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(patients)"))}
+        if "meal_plan" not in cols:
+            conn.execute(text("ALTER TABLE patients ADD COLUMN meal_plan JSON"))

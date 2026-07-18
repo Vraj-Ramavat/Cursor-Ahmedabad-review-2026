@@ -73,6 +73,12 @@ class Patient(Base):
     diet_type: Mapped[str | None] = mapped_column(String, nullable=True)  # veg/non-veg/vegan/eggetarian
     conditions: Mapped[list] = mapped_column(JSON, default=list)  # e.g. ["diabetes","bp"]
     allergies: Mapped[list] = mapped_column(JSON, default=list)  # e.g. ["nuts","dairy"]
+    # Eatvisor onboarding fields (same questionnaire as eatvisor OnboardingScreen)
+    goal: Mapped[str | None] = mapped_column(String, nullable=True)
+    activity_level: Mapped[str | None] = mapped_column(String, nullable=True)
+    dislikes: Mapped[list] = mapped_column(JSON, default=list)
+    # Persisted Eatvisor-style plan so Meals tab survives refresh.
+    meal_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     intake_sessions: Mapped[list[IntakeSession]] = relationship(

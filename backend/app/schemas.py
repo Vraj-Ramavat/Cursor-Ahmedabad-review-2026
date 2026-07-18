@@ -14,6 +14,9 @@ class IntakeStartRequest(BaseModel):
     gender: str | None = None
     phone: str | None = None
     abha_id: str | None = None
+    # When provided, the visit attaches to an existing account instead of
+    # creating a new anonymous patient (set by the logged-in patient app).
+    patient_id: str | None = None
 
 
 class IntakeStartResponse(BaseModel):
