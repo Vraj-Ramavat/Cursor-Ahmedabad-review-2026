@@ -30,6 +30,25 @@ def _expire_if_stale(note: SelfCareNote) -> None:
             note.approval_status = ApprovalStatus.expired
 
 
+@router.get("/session/{session_id}", response_model=SelfCareNoteOut | None)
+def note_for_session(session_id: str, db: Session = Depends(get_db)):
+    """Patient-facing: returns the note ONLY once a doctor approved and sent it.
+
+    Pending/expired drafts are never exposed here — the doctor gate is the
+    boundary between draft and patient-visible content.
+    """
+    note = (
+        db.query(SelfCareNote)
+        .filter(
+            SelfCareNote.session_id == session_id,
+            SelfCareNote.sent_to_patient.is_(True),
+        )
+        .order_by(SelfCareNote.created_at.desc())
+        .first()
+    )
+    return _to_out(note) if note else None
+
+
 @router.get("/pending", response_model=list[SelfCareNoteOut])
 def pending_notes(db: Session = Depends(get_db)):
     notes = db.query(SelfCareNote).filter(

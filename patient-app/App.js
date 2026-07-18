@@ -1,5 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  KeyboardAvoidingView,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -13,146 +15,311 @@ import {
   startIntake,
   answerIntake,
   getQueueStatus,
+  getSelfCareNote,
   uploadDocument,
 } from "./src/api";
 
-const SEV_COLOR = { red: "#d92d20", amber: "#dc9a00", green: "#099250" };
+const SEV_COLOR = { red: "#f04438", amber: "#f79009", green: "#12b76a" };
+const SEV_TEXT = {
+  red: "URGENT — please tell the reception desk you've been flagged RED.",
+  amber: "Priority — the doctor will see you soon.",
+  green: "You're checked in. We'll keep you updated.",
+};
+
+// Registration steps the AI receptionist walks through before the medical part.
+const REG_STEPS = [
+  { key: "name", prompt: "Welcome to the clinic! I'm your intake assistant — I'll get you registered and make sure the doctor has everything ready. What's your full name?" },
+  { key: "age", prompt: "Nice to meet you. How old are you?", keyboard: "numeric" },
+  { key: "gender", prompt: "And how do you describe your gender? (male / female / other — whatever you prefer)" },
+  { key: "phone", prompt: "What's a phone number we can reach you on? You can type 'skip' if you'd rather not share.", keyboard: "phone-pad" },
+  { key: "complaint", prompt: "Thanks, you're all set. Now — what brings you in today? Describe it in your own words." },
+];
 
 export default function App() {
-  const [stage, setStage] = useState("start"); // start | qa | done
-  const [name, setName] = useState("");
-  const [complaint, setComplaint] = useState("chest pain");
+  const [messages, setMessages] = useState([{ role: "assistant", text: REG_STEPS[0].prompt }]);
+  const [input, setInput] = useState("");
+  const [regStep, setRegStep] = useState(0);
+  const [profile, setProfile] = useState({});
   const [session, setSession] = useState(null);
-  const [question, setQuestion] = useState(null);
   const [nodeId, setNodeId] = useState(null);
-  const [answer, setAnswer] = useState("");
   const [severity, setSeverity] = useState("green");
+  const [done, setDone] = useState(false);
   const [position, setPosition] = useState(null);
   const [live, setLive] = useState(true);
   const [docs, setDocs] = useState([]);
+  const [note, setNote] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [listening, setListening] = useState(false);
+  const scrollRef = useRef(null);
+  const recogRef = useRef(null);
 
-  async function begin() {
-    const res = await startIntake(name || "Patient", complaint);
-    setSession(res.session_id);
-    setQuestion(res.question);
-    setNodeId(res.node_id);
-    setStage(res.complete ? "done" : "qa");
-  }
+  const say = (text) => setMessages((m) => [...m, { role: "assistant", text }]);
+  const heard = (text) => setMessages((m) => [...m, { role: "patient", text }]);
 
-  async function submitAnswer() {
-    const res = await answerIntake(session, nodeId, answer);
-    setSeverity(res.severity);
-    setAnswer("");
-    if (res.complete) {
-      setStage("done");
-      setQuestion(null);
-    } else {
-      setQuestion(res.question);
-      setNodeId(res.node_id);
+  useEffect(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+  }, [messages, done]);
+
+  // Live queue position + doctor-approved note polling once intake completes.
+  useEffect(() => {
+    if (!done || !session) return;
+    const poll = setInterval(async () => {
+      try {
+        const q = await getQueueStatus();
+        setLive(q.live);
+        const idx = q.entries.findIndex((e) => e.session_id === session);
+        setPosition(idx >= 0 ? idx + 1 : null);
+        if (!note) {
+          const n = await getSelfCareNote(session);
+          if (n && n.sent_to_patient) {
+            setNote(n);
+            say("Your doctor has approved a self-care note for you — it's shown below.");
+          }
+        }
+      } catch {}
+    }, 5000);
+    return () => clearInterval(poll);
+  }, [done, session, note]);
+
+  async function handleSend(textOverride) {
+    const text = (textOverride ?? input).trim();
+    if (!text || busy) return;
+    setInput("");
+    heard(text);
+    setBusy(true);
+    try {
+      if (regStep < REG_STEPS.length) {
+        await handleRegistration(text);
+      } else if (session && nodeId) {
+        const r = await answerIntake(session, nodeId, text);
+        setSeverity(r.severity);
+        if (r.complete) {
+          setDone(true);
+          setNodeId(null);
+          say("Thank you — that's everything I need. You're in the queue now. You can upload any prescriptions or reports below while you wait.");
+        } else {
+          setNodeId(r.node_id);
+          say(r.question);
+        }
+      }
+    } catch {
+      say("Sorry, I couldn't reach the clinic server just now. Please try that again.");
+    } finally {
+      setBusy(false);
     }
   }
 
-  useEffect(() => {
-    if (stage !== "done" || !session) return;
-    const poll = setInterval(async () => {
-      const q = await getQueueStatus();
-      setLive(q.live);
-      const idx = q.entries.findIndex((e) => e.session_id === session);
-      setPosition(idx >= 0 ? idx + 1 : null);
-    }, 5000);
-    return () => clearInterval(poll);
-  }, [stage, session]);
+  async function handleRegistration(text) {
+    const step = REG_STEPS[regStep];
+    const updated = { ...profile };
+    if (step.key === "phone" && text.toLowerCase() === "skip") {
+      updated.phone = null;
+    } else if (step.key !== "complaint") {
+      updated[step.key] = text;
+    }
+    setProfile(updated);
+
+    if (step.key === "complaint") {
+      const res = await startIntake(updated, text);
+      setSession(res.session_id);
+      setSeverity(res.severity);
+      say(res.greeting);
+      if (res.complete) {
+        setDone(true);
+        say("You're checked in and in the queue — details below.");
+      } else {
+        setNodeId(res.node_id);
+        say(res.question);
+      }
+      setRegStep(regStep + 1);
+      return;
+    }
+
+    const next = REG_STEPS[regStep + 1];
+    setRegStep(regStep + 1);
+    say(next.prompt);
+  }
+
+  // Voice input via the Web Speech API (available in Expo web / Chrome).
+  function toggleVoice() {
+    const SR = typeof window !== "undefined" &&
+      (window.SpeechRecognition || window.webkitSpeechRecognition);
+    if (!SR) {
+      say("Voice input isn't supported in this browser — please type instead.");
+      return;
+    }
+    if (listening) {
+      recogRef.current?.stop();
+      setListening(false);
+      return;
+    }
+    const recog = new SR();
+    recog.lang = "en-IN";
+    recog.interimResults = false;
+    recog.onresult = (e) => {
+      const text = e.results[0][0].transcript;
+      setListening(false);
+      handleSend(text);
+    };
+    recog.onerror = () => setListening(false);
+    recog.onend = () => setListening(false);
+    recogRef.current = recog;
+    setListening(true);
+    recog.start();
+  }
 
   async function pickAndUpload() {
     const res = await DocumentPicker.getDocumentAsync({ type: ["image/*", "application/pdf"] });
     if (res.canceled) return;
     const file = res.assets[0];
-    const uploaded = await uploadDocument(session, file);
-    setDocs((d) => [...d, uploaded]);
+    setBusy(true);
+    try {
+      const uploaded = await uploadDocument(session, file);
+      setDocs((d) => [...d, uploaded]);
+      const pendingMsg = uploaded.fields?.length
+        ? `I extracted ${uploaded.fields.length} fields from "${uploaded.filename}"${uploaded.low_confidence_count ? ` (${uploaded.low_confidence_count} flagged for the doctor to verify)` : ""}. It's been added to your record for the doctor.`
+        : `"${uploaded.filename}" is uploaded and attached to your record — text extraction will finish shortly.`;
+      say(pendingMsg);
+    } catch {
+      say("The upload didn't go through — please try again.");
+    } finally {
+      setBusy(false);
+    }
   }
+
+  const voiceAvailable =
+    typeof window !== "undefined" &&
+    (window.SpeechRecognition || window.webkitSpeechRecognition);
 
   return (
     <SafeAreaView style={styles.safe}>
-      <ScrollView contentContainerStyle={styles.container}>
+      <View style={styles.header}>
         <Text style={styles.title}>Hospital Visit Prep</Text>
-
-        {stage === "start" && (
-          <View style={styles.card}>
-            <Text style={styles.label}>Your name</Text>
-            <TextInput style={styles.input} value={name} onChangeText={setName}
-              placeholder="Name" placeholderTextColor="#8a94a6" />
-            <Text style={styles.label}>What brings you in?</Text>
-            <TextInput style={styles.input} value={complaint} onChangeText={setComplaint}
-              placeholder="e.g. chest pain" placeholderTextColor="#8a94a6" />
-            <TouchableOpacity style={styles.btn} onPress={begin}>
-              <Text style={styles.btnText}>Start intake</Text>
-            </TouchableOpacity>
+        {session && (
+          <View style={[styles.sevPill, { backgroundColor: SEV_COLOR[severity] }]}>
+            <Text style={styles.sevPillText}>{severity.toUpperCase()}</Text>
           </View>
         )}
+      </View>
 
-        {stage === "qa" && (
-          <View style={styles.card}>
-            <Text style={styles.question}>{question}</Text>
-            <TextInput style={styles.input} value={answer} onChangeText={setAnswer}
-              placeholder="Type your answer" placeholderTextColor="#8a94a6" multiline />
-            <TouchableOpacity style={styles.btn} onPress={submitAnswer}>
+      {done && (
+        <View style={styles.statusCard}>
+          <Text style={styles.statusMain}>
+            {position ? `#${position} in queue` : "Finding your place in the queue…"}
+          </Text>
+          <Text style={[styles.statusSub, { color: SEV_COLOR[severity] }]}>
+            {SEV_TEXT[severity]}
+          </Text>
+          {!live && (
+            <Text style={styles.paused}>Live updates paused — position shown may lag.</Text>
+          )}
+        </View>
+      )}
+
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
+        <ScrollView ref={scrollRef} style={styles.chat} contentContainerStyle={{ padding: 14 }}>
+          {messages.map((m, i) => (
+            <View
+              key={i}
+              style={[styles.bubble, m.role === "assistant" ? styles.aiBubble : styles.userBubble]}
+            >
+              <Text style={styles.bubbleWho}>
+                {m.role === "assistant" ? "Clinic Assistant" : "You"}
+              </Text>
+              <Text style={styles.bubbleText}>{m.text}</Text>
+            </View>
+          ))}
+
+          {done && (
+            <View style={styles.uploadArea}>
+              <TouchableOpacity style={styles.uploadBtn} onPress={pickAndUpload} disabled={busy}>
+                <Text style={styles.btnText}>Upload prescription / report</Text>
+              </TouchableOpacity>
+              {docs.map((d) => (
+                <View key={d.id} style={styles.docRow}>
+                  <Text style={styles.docName}>{d.filename}</Text>
+                  <Text style={styles.docMeta}>
+                    {d.fields?.length || 0} fields · {d.low_confidence_count || 0} to verify
+                  </Text>
+                </View>
+              ))}
+              {note && (
+                <View style={styles.noteCard}>
+                  <Text style={styles.noteTitle}>Self-care note (doctor approved)</Text>
+                  <Text style={styles.bubbleText}>{note.final_text || note.draft_text}</Text>
+                </View>
+              )}
+            </View>
+          )}
+        </ScrollView>
+
+        {!done && (
+          <View style={styles.inputRow}>
+            {voiceAvailable ? (
+              <TouchableOpacity
+                style={[styles.micBtn, listening && styles.micOn]}
+                onPress={toggleVoice}
+              >
+                <Text style={styles.btnText}>{listening ? "…" : "🎤"}</Text>
+              </TouchableOpacity>
+            ) : null}
+            <TextInput
+              style={styles.input}
+              value={input}
+              onChangeText={setInput}
+              placeholder={listening ? "Listening…" : "Type your answer"}
+              placeholderTextColor="#94969c"
+              onSubmitEditing={() => handleSend()}
+              editable={!busy}
+              keyboardType={REG_STEPS[regStep]?.keyboard || "default"}
+            />
+            <TouchableOpacity style={styles.sendBtn} onPress={() => handleSend()} disabled={busy}>
               <Text style={styles.btnText}>Send</Text>
             </TouchableOpacity>
           </View>
         )}
-
-        {stage === "done" && (
-          <View style={styles.card}>
-            <View style={[styles.pill, { backgroundColor: SEV_COLOR[severity] }]}>
-              <Text style={styles.pillText}>{severity.toUpperCase()}</Text>
-            </View>
-            <Text style={styles.info}>
-              {position ? `You are #${position} in the queue.` : "Finding your place in the queue…"}
-            </Text>
-            {!live && (
-              <Text style={styles.paused}>Live updates paused — showing last-known order.</Text>
-            )}
-
-            <Text style={styles.label}>Upload documents</Text>
-            <Text style={styles.hint}>
-              Prescriptions, lab or scan reports. We read the printed text only.
-            </Text>
-            <TouchableOpacity style={styles.btnAlt} onPress={pickAndUpload}>
-              <Text style={styles.btnText}>Add a document</Text>
-            </TouchableOpacity>
-
-            {docs.map((d) => (
-              <View key={d.id} style={styles.doc}>
-                <Text style={styles.docTitle}>{d.filename}</Text>
-                <Text style={styles.hint}>
-                  {d.fields.length} fields extracted · {d.low_confidence_count} low-confidence
-                </Text>
-              </View>
-            ))}
-          </View>
-        )}
-      </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#0f1420" },
-  container: { padding: 16 },
-  title: { color: "#e7ecf3", fontSize: 22, fontWeight: "700", marginBottom: 16 },
-  card: { backgroundColor: "#1a2130", borderRadius: 12, padding: 16 },
-  label: { color: "#8a94a6", fontSize: 13, marginTop: 12, marginBottom: 6 },
-  hint: { color: "#8a94a6", fontSize: 12, marginBottom: 8 },
-  input: { backgroundColor: "#0d121c", color: "#e7ecf3", borderRadius: 8,
-    padding: 12, borderWidth: 1, borderColor: "#232c3d" },
-  question: { color: "#e7ecf3", fontSize: 16, marginBottom: 12, lineHeight: 22 },
-  btn: { backgroundColor: "#3b82f6", padding: 14, borderRadius: 8, marginTop: 14, alignItems: "center" },
-  btnAlt: { backgroundColor: "#334155", padding: 12, borderRadius: 8, marginTop: 6, alignItems: "center" },
+  safe: { flex: 1, backgroundColor: "#0c111d" },
+  flex: { flex: 1 },
+  header: { flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingHorizontal: 16, paddingVertical: 12 },
+  title: { color: "#f0f1f5", fontSize: 20, fontWeight: "700" },
+  sevPill: { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12 },
+  sevPillText: { color: "white", fontWeight: "700", fontSize: 12 },
+  statusCard: { backgroundColor: "#161b26", marginHorizontal: 14, borderRadius: 12,
+    padding: 14, borderWidth: 1, borderColor: "#333741" },
+  statusMain: { color: "#f0f1f5", fontSize: 18, fontWeight: "700" },
+  statusSub: { fontSize: 13, marginTop: 4 },
+  paused: { color: "#f79009", fontSize: 12, marginTop: 6 },
+  chat: { flex: 1 },
+  bubble: { maxWidth: "82%", borderRadius: 14, padding: 10, marginBottom: 8 },
+  aiBubble: { backgroundColor: "#1f242f", alignSelf: "flex-start" },
+  userBubble: { backgroundColor: "#2e90fa", alignSelf: "flex-end" },
+  bubbleWho: { color: "#94969c", fontSize: 11, fontWeight: "600", marginBottom: 2 },
+  bubbleText: { color: "#f0f1f5", fontSize: 15, lineHeight: 21 },
+  inputRow: { flexDirection: "row", padding: 10, gap: 8, alignItems: "center" },
+  input: { flex: 1, backgroundColor: "#161b26", color: "#f0f1f5", borderRadius: 10,
+    paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1, borderColor: "#333741" },
+  sendBtn: { backgroundColor: "#2e90fa", borderRadius: 10, paddingHorizontal: 18,
+    paddingVertical: 11 },
+  micBtn: { backgroundColor: "#1f242f", borderRadius: 10, paddingHorizontal: 12,
+    paddingVertical: 10, borderWidth: 1, borderColor: "#333741" },
+  micOn: { backgroundColor: "#f04438" },
   btnText: { color: "white", fontWeight: "700" },
-  pill: { alignSelf: "flex-start", paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12 },
-  pillText: { color: "white", fontWeight: "700", fontSize: 12 },
-  info: { color: "#e7ecf3", fontSize: 16, marginTop: 12 },
-  paused: { color: "#dc9a00", marginTop: 8 },
-  doc: { backgroundColor: "#141a26", borderRadius: 8, padding: 10, marginTop: 8 },
-  docTitle: { color: "#e7ecf3", fontWeight: "600" },
+  uploadArea: { marginTop: 10 },
+  uploadBtn: { backgroundColor: "#344054", borderRadius: 10, padding: 13, alignItems: "center" },
+  docRow: { backgroundColor: "#161b26", borderRadius: 10, padding: 10, marginTop: 8 },
+  docName: { color: "#f0f1f5", fontWeight: "600" },
+  docMeta: { color: "#94969c", fontSize: 12, marginTop: 2 },
+  noteCard: { backgroundColor: "#0f2b1d", borderColor: "#12b76a", borderWidth: 1,
+    borderRadius: 10, padding: 12, marginTop: 10 },
+  noteTitle: { color: "#12b76a", fontWeight: "700", marginBottom: 4 },
 });

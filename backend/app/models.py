@@ -54,6 +54,9 @@ class FieldSource(str, enum.Enum):
 
 
 class Patient(Base):
+    """A patient account. Persists across visits: the app logs in by phone and
+    reuses the same record, so the doctor sees history, not anonymous intakes."""
+
     __tablename__ = "patients"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
@@ -61,7 +64,15 @@ class Patient(Base):
     age: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gender: Mapped[str | None] = mapped_column(String, nullable=True)
     abha_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    phone: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Demo-grade bearer token; swap for JWT/OAuth before production.
+    auth_token: Mapped[str] = mapped_column(String, default=_uuid, index=True)
+    # Health profile for the deterministic meal engine.
+    weight_kg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    height_cm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    diet_type: Mapped[str | None] = mapped_column(String, nullable=True)  # veg/non-veg/vegan/eggetarian
+    conditions: Mapped[list] = mapped_column(JSON, default=list)  # e.g. ["diabetes","bp"]
+    allergies: Mapped[list] = mapped_column(JSON, default=list)  # e.g. ["nuts","dairy"]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     intake_sessions: Mapped[list[IntakeSession]] = relationship(
