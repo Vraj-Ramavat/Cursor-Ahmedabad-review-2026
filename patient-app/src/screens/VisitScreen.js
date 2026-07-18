@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   SafeAreaView,
@@ -10,8 +11,15 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { answerIntake, getQueueStatus, startIntake } from "../api";
+import { answerIntake, getQueueStatus, myVisits, startIntake } from "../api";
 import { cardShadow, colors, radius, sevColor, sevText, spacing } from "../theme";
+
+const ACKS = [
+  "Thank you — that helps.",
+  "Got it, I'm noting that down.",
+  "Okay, thanks for telling me.",
+  "I hear you.",
+];
 
 export default function VisitScreen({ account, visit, onVisitChange }) {
   const [messages, setMessages] = useState([]);
@@ -24,6 +32,9 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
   const [complaint, setComplaint] = useState(visit?.complaint || "");
   const [position, setPosition] = useState(null);
   const [live, setLive] = useState(true);
+  const [history, setHistory] = useState([]);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const ackIdx = useRef(0);
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -43,6 +54,24 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
   useEffect(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
   }, [messages]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingHistory(true);
+      try {
+        const v = await myVisits();
+        if (!cancelled) setHistory(Array.isArray(v) ? v : []);
+      } catch {
+        if (!cancelled) setHistory([]);
+      } finally {
+        if (!cancelled) setLoadingHistory(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [account?.patient_id, phase]);
 
   useEffect(() => {
     if (phase !== "done" || !sessionId) return;
@@ -65,6 +94,12 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
     setMessages((m) => [...m, { role: "patient", text }]);
   }
 
+  function nextAck() {
+    const t = ACKS[ackIdx.current % ACKS.length];
+    ackIdx.current += 1;
+    return t;
+  }
+
   function syncVisit(patch) {
     onVisitChange((prev) => ({
       ...(prev || {}),
@@ -81,7 +116,7 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
     setPhase("complaint");
     const first = account?.name?.split(/\s+/)[0] || "there";
     say(
-      `Hi ${first}, I'm the clinic AI nurse. I'll ask just a few short questions so the doctor is ready — this is not a diagnosis. What brings you in today?`,
+      `Hi ${first}, it's good to see you. I'm your clinic AI nurse — think of me as a friendly check-in before the doctor. I'll ask a few short questions so nothing important gets missed. This is not a diagnosis. What brings you in today?`,
     );
   }
 
@@ -103,7 +138,7 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
         if (res.complete) {
           setPhase("done");
           setNodeId(null);
-          say("Thank you — you're checked in and in the queue.");
+          say("You're all set — thanks for your patience. You're in the live queue now. Sit tight, and tell reception if anything suddenly feels worse.");
           syncVisit({
             sessionId: res.session_id,
             nodeId: null,
@@ -128,17 +163,20 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
         if (res.complete) {
           setPhase("done");
           setNodeId(null);
-          say("Thank you — that's everything. You're in the queue now.");
+          say("That's everything I needed — thank you. You're checked in and in the queue. We'll keep your place updated here.");
           syncVisit({ nodeId: null, severity: res.severity, complete: true });
         } else {
           setNodeId(res.node_id);
-          if (res.acknowledgement) say(res.acknowledgement);
-          say(res.question);
+          say(res.acknowledgement || nextAck());
+          if (res.question) say(res.question);
           syncVisit({ nodeId: res.node_id, severity: res.severity, complete: false });
         }
       }
     } catch (e) {
-      say(e.message || "Couldn't reach the clinic server. Please try again.");
+      say(
+        e.message ||
+          "I couldn't reach the clinic server just now. Please try that answer again in a moment.",
+      );
     } finally {
       setBusy(false);
     }
@@ -153,6 +191,19 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
     setPhase("idle");
     setPosition(null);
     onVisitChange(null);
+  }
+
+  function formatDate(iso) {
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } catch {
+      return iso;
+    }
   }
 
   const chatting = phase === "complaint" || phase === "intake";
@@ -186,16 +237,38 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
       >
         <View style={styles.chatCard}>
           {phase === "idle" ? (
-            <View style={styles.idle}>
+            <ScrollView contentContainerStyle={styles.idle}>
               <Text style={styles.idleTitle}>Ready to check in?</Text>
               <Text style={styles.idleSub}>
-                We'll ask a few questions so your doctor has everything ready. This is not a
-                diagnosis — just visit preparation.
+                Chat with the AI nurse — a few short questions so your doctor is prepared. Not a
+                diagnosis, just visit prep.
               </Text>
               <TouchableOpacity style={styles.primaryBtn} onPress={beginVisit}>
                 <Text style={styles.primaryBtnText}>Start new visit</Text>
               </TouchableOpacity>
-            </View>
+
+              <Text style={styles.histTitle}>Your visits ({history.length})</Text>
+              {loadingHistory ? (
+                <ActivityIndicator color={colors.primary} />
+              ) : history.length === 0 ? (
+                <Text style={styles.idleSub}>No past visits yet — start one above.</Text>
+              ) : (
+                history.map((v) => (
+                  <View key={v.session_id} style={styles.histCard}>
+                    <View style={styles.histRow}>
+                      <Text style={styles.histDate}>{formatDate(v.started_at)}</Text>
+                      <View style={[styles.pill, { backgroundColor: sevColor[v.severity] || colors.green }]}>
+                        <Text style={styles.pillText}>{(v.severity || "green").toUpperCase()}</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.histComplaint}>{v.chief_complaint || "Visit"}</Text>
+                    <Text style={styles.histMeta}>
+                      {v.completed ? "Completed" : "In progress"} · doctor can see this on the dashboard
+                    </Text>
+                  </View>
+                ))
+              )}
+            </ScrollView>
           ) : (
             <ScrollView
               ref={scrollRef}
@@ -211,7 +284,7 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
                   ]}
                 >
                   <Text style={[styles.bubbleWho, m.role === "patient" && styles.bubbleWhoLight]}>
-                    {m.role === "assistant" ? "Assistant" : "You"}
+                    {m.role === "assistant" ? "AI Nurse" : "You"}
                   </Text>
                   <Text style={[styles.bubbleText, m.role === "patient" && styles.bubbleTextLight]}>
                     {m.text}
@@ -245,7 +318,7 @@ export default function VisitScreen({ account, visit, onVisitChange }) {
 
           {phase === "done" && (
             <TouchableOpacity style={styles.secondaryBtn} onPress={resetVisit}>
-              <Text style={styles.secondaryBtnText}>Start another visit</Text>
+              <Text style={styles.secondaryBtnText}>Back to visits</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -289,7 +362,7 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     ...cardShadow,
   },
-  idle: { flex: 1, padding: spacing.lg, justifyContent: "center" },
+  idle: { padding: spacing.lg, paddingBottom: spacing.xl },
   idleTitle: { fontSize: 20, fontWeight: "700", color: colors.text },
   idleSub: { color: colors.muted, marginTop: spacing.sm, lineHeight: 22 },
   primaryBtn: {
@@ -298,8 +371,29 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     alignItems: "center",
     marginTop: spacing.lg,
+    marginBottom: spacing.lg,
   },
   primaryBtnText: { color: "#fff", fontWeight: "700", fontSize: 16 },
+  histTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: colors.muted,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    marginBottom: spacing.sm,
+  },
+  histCard: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+    backgroundColor: colors.bg,
+  },
+  histRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  histDate: { fontWeight: "700", color: colors.text },
+  histComplaint: { color: colors.text, marginTop: 6 },
+  histMeta: { color: colors.muted, fontSize: 12, marginTop: 4 },
   secondaryBtn: {
     borderTopWidth: 1,
     borderTopColor: colors.border,
